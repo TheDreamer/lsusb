@@ -17,7 +17,9 @@ List USB devices
   -d  [vendor]:[product]
        Show only devices with the specified vendor and
        product ID numbers (in hexadecimal)
+  -i  Show current available, required, and extra (in mA)
   -p  Display manufacturer names in parentheses
+  -a  Align columns, implies '-p', mainly makes sense when used with '-i'
   -t  Dump the physical USB device hierarchy as a tree
   -V  Show version of program
   -h  Show usage and help
@@ -90,7 +92,7 @@ parse ()  {
         bus_num=`printf "%0*d" 3 "$bus_num"`
 
 	# Strip the parentheses from manufacturer name unless so specified.
-	if [ -z "$parens" ]; then	
+	if [ -z "$format" ]; then	
 	 	manufacturer=`echo "$manufacturer" | sed 's/(//; s/)//'`
 	fi
 
@@ -99,6 +101,46 @@ parse ()  {
 	serial_number=`echo "$device" | egrep "Serial Number" | sed 's/Serial Number: //; s/^ *//g; s/ *$//g'`
 	if [ -n "$serial_number" ]; then
 		serial_str=" Serial: ""$serial_number"
+	fi
+
+	if [ -n "$current" ]; then
+	  # Current Stats, as available.
+	  current_str=""
+	  cur_avail_num=`echo "$device" | egrep "Current Available" | sed 's/Current Available (mA): //; s/^ *//g; s/ *$//g'`
+	  cur_req_str=""
+	  cur_req_num=`echo "$device" | egrep "Current Required" | sed 's/Current Required (mA): //; s/^ *//g; s/ *$//g'`
+	  cur_extra_str=""
+	  cur_extra_num=`echo "$device" | egrep "Extra Operating Current" | sed 's/Extra Operating Current (mA): //; s/^ *//g; s/ *$//g'`
+	  if [ -n "$cur_avail_num" -o -n "$cur_req_num" -o -n "$cur_extra_num" ]; then
+	    can=0
+	    crn=0
+	    cur_leg="["
+	    if [ -n "$cur_avail_num" ]; then
+	      cur_leg="$cur_leg""a"
+	      cur_str="$cur_avail_num"
+	      can=1
+	    fi
+	    if [ -n "$cur_req_num" ]; then
+	      if [ $can -eq 1 ]; then
+		cur_leg="$cur_leg""/"
+		cur_str="$cur_str""/"
+	      fi
+	      cur_leg="$cur_leg""r"
+	      cur_str="$cur_str""$cur_req_num"
+	      crn=1
+	    fi
+	    if [ -n "$cur_extra_num" ]; then
+	      if [ $can -eq 1 -o $crn -eq 1 ]; then
+		cur_leg="$cur_leg""/"
+		cur_str="$cur_str""/"
+	      fi
+	      cur_leg="$cur_leg""e"
+	      cur_str="$cur_str""$cur_extra_num"
+	    fi
+	    cur_leg="$cur_leg""]"
+
+	    current_str="$cur_leg"": ""$cur_str"
+	  fi
 	fi
 
 	# Don't filter if we're building the tree.
@@ -203,7 +245,8 @@ buildtreeline () {
 	else
 		spaces="${spaces}|__ "
 	fi
-	treeline="${locationID}${spaces}Bus ""${bus_num}"".Dev ""${device_num}"": ""${name}"", ""${speed}"
+
+	treeline="${locationID}${spaces}Bus ""${bus_num}"".Dev ""${device_num}"": [""${VID}"":""${PID}""] ""${manufacturer}"" ""${name}"", ""${speed}"
 }
 
 tree () {
@@ -249,7 +292,7 @@ tree () {
 }
 
 # Parse options
-while getopts ":hvpd:s:Vt" opt; do
+while getopts ":hvtVd:s:pai" opt; do
   case "$opt" in
     h) help ; exit 0 ;;     # help
     v) verbose ; exit 0 ;;  # verbose
@@ -257,7 +300,9 @@ while getopts ":hvpd:s:Vt" opt; do
     V) version ; exit 0 ;;  # version
     d) vid_pid=$OPTARG ;;   # filter
     s) bus_dev=$OPTARG ;;   # filter
-    p) parens="yes" ;;	    # formatter
+    p) format="parens" ;;   # formatter
+    a) format="aligned" ;;
+    i) current="yes" ;;
     *) echo >&2 "lsusb: invalid option -- '$OPTARG'" ; help ; exit 1
   esac
 done
@@ -282,26 +327,78 @@ setup
 # with the '#' symbol in case other parameters that contain a dash
 # will not be interfered
 
-devices=`echo "$rawlog" | egrep -B 2 -A 6 "Product ID" | sed 's/^--/#/'`
+cols="$COLUMNS"
+if [ -z "$cols" ]; then
+  cols="$(stty -a < "$(/usr/bin/tty)" | egrep -o '([0-9]+) columns' | cut -d' ' -f 1)"
+fi
+
+read -d '' gawkScript << EOF
+BEGIN {
+  cols="$cols";
+  FS="@";
+  j=0;
+  tcols=0;
+  mNF=0;
+}
+
+{
+  j++;
+  if (mNF < NF) { mNF = NF }
+  for (i=1;i<=NF;i++) {
+    out[j,i] = \$i;
+    if (length(\$i) > l[i]) { l[i] = length(\$i) }
+  }
+  mNR = j;
+}
+
+END {
+  for (i=1;i<=mNF;i++) {
+    f[i] = l[i]
+    tcols+=(l[i]+1)
+  }
+  if (cols < tcols) { f[3] -= (tcols - cols)+1 }
+  for (j=1;j<=mNR;j++) {
+    for (i=1;i<=mNF;i++) {
+      printf("%-*.*s%s",f[i],f[i],out[j,i],(i == mNF ? "\\\\n":(length(out[j,i]) > f[i] ? "|":" ")));
+    }
+  }
+}
+EOF
+
+postf="tr '@' ' '"
+if [ "$format" = "aligned" ]; then
+  postf="gawk '$gawkScript'"
+fi
+
+#devices=`echo "$rawlog" | egrep -B 2 -A 6 "Product ID" | sed 's/^--/#/'`
+devices=$(echo "$rawlog" | perl -ne 'BEGIN { $/="\n\n" }; print $prev,"\n",$_,"#\n#\n" if $_ =~ /Product ID/; $prev=$_;')
 # Iterate over each entry
-for device in $devices
+(for device in $devices
 do
 	parse
 	if [ $? -eq 0 ]; then
 		# Print the formatted entry
-		echo "Bus ""$bus_num"" Device ""$device_num"": ID ""$VID"":""$PID"" ""$manufacturer"" ""$name"" ""$serial_str"
+		if [ -z "$current" ]; then
+		  echo "Bus ""$bus_num"" Device ""$device_num"":@ID ""$VID"":""$PID""@""$manufacturer"" ""$name"" ""$serial_str"
+		else
+		  echo "Bus ""$bus_num"" Device ""$device_num"":@ID ""$VID"":""$PID""@""$manufacturer"" ""$name"" ""$serial_str""@""$current_str"
+		fi
 	fi
-done
+done ) | eval $postf
 
 buses=`echo "$rawlog" | egrep -A 7 "Bus:" | sed 's/^--/#/'`
-for device in $buses
+(for device in $buses
 do
 	parse
 	if [ $? -eq 0 ]; then
 		# Print the formatted entry
-		echo "Bus ""$bus_num"" Device ""$device_num"": ID ""$VID"":""$PID"" ""$manufacturer"" ""$name"" ""$serial_str"
+		if [ -z "$current" ]; then
+		  echo "Bus ""$bus_num"" Device ""$device_num"":@ID ""$VID"":""$PID""@""$manufacturer"" ""$name"" ""$serial_str"
+		else
+		  echo "Bus ""$bus_num"" Device ""$device_num"":@ID ""$VID"":""$PID""@""$manufacturer"" ""$name"" ""$serial_str""@""$current_str"
+		fi
 	fi
-done
+done) | eval $postf
 
 # Restore the IFS and exit
 cleanup
